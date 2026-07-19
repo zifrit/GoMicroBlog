@@ -31,6 +31,34 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+type requestPayload interface {
+	validate() error
+}
+
+func (request *registerRequest) validate() error {
+	if strings.TrimSpace(request.Username) == "" {
+		return errors.New("username is required")
+	}
+	return nil
+}
+
+func (request *createPostRequest) validate() error {
+	if strings.TrimSpace(request.Username) == "" {
+		return errors.New("username is required")
+	}
+	if strings.TrimSpace(request.Text) == "" {
+		return errors.New("text is required")
+	}
+	return nil
+}
+
+func (request *likeRequest) validate() error {
+	if strings.TrimSpace(request.Username) == "" {
+		return errors.New("username is required")
+	}
+	return nil
+}
+
 func New(s *service.Service) http.Handler {
 	h := &Handler{service: s}
 	mux := http.NewServeMux()
@@ -111,10 +139,14 @@ func (h *Handler) postAction(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, post)
 }
 
-func decodeJSON(w http.ResponseWriter, r *http.Request, value interface{}) bool {
+func decodeJSON(w http.ResponseWriter, r *http.Request, value requestPayload) bool {
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(value); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return false
+	}
+	if err := value.validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return false
 	}
 	return true
