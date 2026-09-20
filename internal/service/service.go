@@ -18,15 +18,15 @@ var (
 
 // Service contains all application data in memory.
 type Service struct {
-	Users      map[string]*models.User
-	Posts      []*models.Post
+	users      map[string]*models.User
+	posts      []*models.Post
 	nextPostID int
 }
 
 func New() *Service {
 	return &Service{
-		Users: make(map[string]*models.User),
-		Posts: make([]*models.Post, 0),
+		users: make(map[string]*models.User),
+		posts: make([]*models.Post, 0),
 	}
 }
 
@@ -35,7 +35,7 @@ func (s *Service) Register(username string) (*models.User, error) {
 	if username == "" {
 		return nil, ErrInvalidUser
 	}
-	if _, exists := s.Users[username]; exists {
+	if _, exists := s.users[username]; exists {
 		return nil, ErrUserExists
 	}
 
@@ -43,13 +43,13 @@ func (s *Service) Register(username string) (*models.User, error) {
 		ID:       username,
 		Username: username,
 	}
-	s.Users[username] = user
-	return user, nil
+	s.users[username] = user
+	return cloneUser(user), nil
 }
 
 func (s *Service) CreatePost(username string, text string) (*models.Post, error) {
 	username = strings.TrimSpace(username)
-	user, exists := s.Users[username]
+	user, exists := s.users[username]
 	if !exists {
 		return nil, ErrUserNotFound
 	}
@@ -65,21 +65,25 @@ func (s *Service) CreatePost(username string, text string) (*models.Post, error)
 		Text:   text,
 		Likes:  make([]string, 0),
 	}
-	s.Posts = append(s.Posts, post)
-	return post, nil
+	s.posts = append(s.posts, post)
+	return clonePost(post), nil
 }
 
 func (s *Service) ListPosts() []*models.Post {
-	return s.Posts
+	posts := make([]*models.Post, 0, len(s.posts))
+	for _, post := range s.posts {
+		posts = append(posts, clonePost(post))
+	}
+	return posts
 }
 
 func (s *Service) LikePost(postID int, username string) (*models.Post, error) {
 	username = strings.TrimSpace(username)
-	if _, exists := s.Users[username]; !exists {
+	if _, exists := s.users[username]; !exists {
 		return nil, ErrUserNotFound
 	}
 
-	for _, post := range s.Posts {
+	for _, post := range s.posts {
 		if post.ID != postID {
 			continue
 		}
@@ -89,8 +93,26 @@ func (s *Service) LikePost(postID int, username string) (*models.Post, error) {
 			}
 		}
 		post.Likes = append(post.Likes, username)
-		return post, nil
+		return clonePost(post), nil
 	}
 
 	return nil, ErrPostNotFound
+}
+
+func cloneUser(user *models.User) *models.User {
+	if user == nil {
+		return nil
+	}
+	cloneUser := *user
+	return &cloneUser
+}
+
+func clonePost(post *models.Post) *models.Post {
+	if post == nil {
+		return nil
+	}
+	clonePost := *post
+	clonePost.Author = cloneUser(post.Author)
+	clonePost.Likes = append([]string(nil), post.Likes...)
+	return &clonePost
 }
