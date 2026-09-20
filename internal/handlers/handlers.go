@@ -131,7 +131,7 @@ func (h *Handler) postAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	post, err := h.service.LikePost(postID, strings.TrimSpace(request.Username))
+	post, err := h.service.LikePost(postID, request.Username)
 	if err != nil {
 		writeServiceError(w, err)
 		return
