@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -53,10 +54,13 @@ func main() {
 func newApplication(output io.Writer) *application {
 	events := logger.New(output, 128)
 	appService := service.New(events)
-	likes := queue.NewLikeQueue(128, func(job queue.LikeJob) error {
-		_, err := appService.LikePost(job.PostID, job.Username)
-		return err
-	})
+	likes := queue.NewLikeQueue(128,
+		func(job queue.LikeJob) error {
+			_, err := appService.LikePost(job.PostID, job.Username)
+			return err
+		}, func(job queue.LikeJob, err error) {
+			events.Publish(fmt.Sprintf("like failed: post_id=%d username=%s error=%v", job.PostID, job.Username, err))
+		})
 
 	mux := http.NewServeMux()
 	mux.Handle("/debug/pprof/", http.DefaultServeMux)

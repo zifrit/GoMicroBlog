@@ -15,15 +15,17 @@ type LikeJob struct {
 type LikeQueue struct {
 	jobs    chan LikeJob
 	process func(LikeJob) error
+	onError func(LikeJob, error)
 	mu      sync.RWMutex
 	closed  bool
 	done    chan struct{}
 }
 
-func NewLikeQueue(bufferSize int, process func(LikeJob) error) *LikeQueue {
+func NewLikeQueue(bufferSize int, process func(LikeJob) error, onError func(LikeJob, error)) *LikeQueue {
 	queue := &LikeQueue{
 		jobs:    make(chan LikeJob, bufferSize),
 		process: process,
+		onError: onError,
 		done:    make(chan struct{}),
 	}
 	go queue.run()
@@ -31,8 +33,8 @@ func NewLikeQueue(bufferSize int, process func(LikeJob) error) *LikeQueue {
 }
 
 func (q *LikeQueue) Submit(job LikeJob) error {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	if q.closed {
 		return ErrClosed
 	}
@@ -55,6 +57,8 @@ func (q *LikeQueue) Close() {
 func (q *LikeQueue) run() {
 	defer close(q.done)
 	for job := range q.jobs {
-		_ = q.process(job)
+		if err := q.process(job); err != nil && q.onError != nil {
+			q.onError(job, err)
+		}
 	}
 }

@@ -16,7 +16,7 @@ func TestPostsFlow(t *testing.T) {
 	likes := queue.NewLikeQueue(1, func(job queue.LikeJob) error {
 		_, err := appService.LikePost(job.PostID, job.Username)
 		return err
-	})
+	}, nil)
 	t.Cleanup(likes.Close)
 	handler := New(appService, likes)
 

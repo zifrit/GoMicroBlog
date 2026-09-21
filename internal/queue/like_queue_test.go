@@ -10,7 +10,7 @@ func TestLikeQueueProcessesSubmittedJobInBackground(t *testing.T) {
 	likes := NewLikeQueue(1, func(job LikeJob) error {
 		processed <- job
 		return nil
-	})
+	}, nil)
 	t.Cleanup(likes.Close)
 
 	if err := likes.Submit(LikeJob{PostID: 7, Username: "alice"}); err != nil {
