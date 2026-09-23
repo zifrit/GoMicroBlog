@@ -48,8 +48,8 @@ func (s *Service) Register(username string) (*models.User, error) {
 		return nil, ErrInvalidUser
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if _, exists := s.users[username]; exists {
+		s.mu.Unlock()
 		return nil, ErrUserExists
 	}
 
@@ -58,8 +58,11 @@ func (s *Service) Register(username string) (*models.User, error) {
 		Username: username,
 	}
 	s.users[username] = user
-	s.publish("user registered: " + username)
-	return cloneUser(user), nil
+	result := cloneUser(user)
+	event := "user registered: " + username
+	s.mu.Unlock()
+	s.publish(event)
+	return result, nil
 }
 
 func (s *Service) CreatePost(username string, text string) (*models.Post, error) {
@@ -69,9 +72,9 @@ func (s *Service) CreatePost(username string, text string) (*models.Post, error)
 		return nil, ErrInvalidPost
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	user, exists := s.users[username]
 	if !exists {
+		s.mu.Unlock()
 		return nil, ErrUserNotFound
 	}
 
@@ -82,8 +85,11 @@ func (s *Service) CreatePost(username string, text string) (*models.Post, error)
 		Likes:  make([]string, 0),
 	}
 	s.posts = append(s.posts, post)
-	s.publish("post created: " + post.Text)
-	return clonePost(post), nil
+	result := clonePost(post)
+	event := "post created: " + post.Text
+	s.mu.Unlock()
+	s.publish(event)
+	return result, nil
 }
 
 func (s *Service) ListPosts() []*models.Post {
@@ -99,8 +105,8 @@ func (s *Service) ListPosts() []*models.Post {
 func (s *Service) LikePost(postID int, username string) (*models.Post, error) {
 	username = strings.TrimSpace(username)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if _, exists := s.users[username]; !exists {
+		s.mu.Unlock()
 		return nil, ErrUserNotFound
 	}
 
@@ -110,14 +116,19 @@ func (s *Service) LikePost(postID int, username string) (*models.Post, error) {
 		}
 		for _, likedBy := range post.Likes {
 			if likedBy == username {
+				s.mu.Unlock()
 				return nil, ErrAlreadyLiked
 			}
 		}
 		post.Likes = append(post.Likes, username)
-		s.publish("post liked: " + username)
-		return clonePost(post), nil
+		result := clonePost(post)
+		event := "post liked: " + username
+		s.mu.Unlock()
+		s.publish(event)
+		return result, nil
 	}
 
+	s.mu.Unlock()
 	return nil, ErrPostNotFound
 }
 

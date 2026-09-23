@@ -16,8 +16,10 @@ type LikeQueue struct {
 	jobs    chan LikeJob
 	process func(LikeJob) error
 	onError func(LikeJob, error)
-	mu      sync.RWMutex
+	mu      sync.Mutex
 	closed  bool
+	stop    chan struct{}
+	submits sync.WaitGroup
 	done    chan struct{}
 }
 
@@ -26,6 +28,7 @@ func NewLikeQueue(bufferSize int, process func(LikeJob) error, onError func(Like
 		jobs:    make(chan LikeJob, bufferSize),
 		process: process,
 		onError: onError,
+		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
 	go queue.run()
@@ -34,12 +37,20 @@ func NewLikeQueue(bufferSize int, process func(LikeJob) error, onError func(Like
 
 func (q *LikeQueue) Submit(job LikeJob) error {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	if q.closed {
+		q.mu.Unlock()
 		return ErrClosed
 	}
-	q.jobs <- job
-	return nil
+	q.submits.Add(1)
+	q.mu.Unlock()
+	defer q.submits.Done()
+
+	select {
+	case q.jobs <- job:
+		return nil
+	case <-q.stop:
+		return ErrClosed
+	}
 }
 
 func (q *LikeQueue) Close() {
@@ -49,8 +60,10 @@ func (q *LikeQueue) Close() {
 		return
 	}
 	q.closed = true
-	close(q.jobs)
+	close(q.stop)
 	q.mu.Unlock()
+	q.submits.Wait()
+	close(q.jobs)
 	<-q.done
 }
 

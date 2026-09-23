@@ -11,6 +11,8 @@ type Logger struct {
 	writer *log.Logger
 	mu     sync.Mutex
 	closed bool
+	stop   chan struct{}
+	pubs   sync.WaitGroup
 	done   chan struct{}
 }
 
@@ -18,6 +20,7 @@ func New(output io.Writer, bufferSize int) *Logger {
 	logger := &Logger{
 		events: make(chan string, bufferSize),
 		writer: log.New(output, "microblog: ", log.LstdFlags),
+		stop:   make(chan struct{}),
 		done:   make(chan struct{}),
 	}
 	go logger.run()
@@ -26,11 +29,18 @@ func New(output io.Writer, bufferSize int) *Logger {
 
 func (l *Logger) Publish(event string) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.closed {
+		l.mu.Unlock()
 		return
 	}
-	l.events <- event
+	l.pubs.Add(1)
+	l.mu.Unlock()
+	defer l.pubs.Done()
+
+	select {
+	case l.events <- event:
+	case <-l.stop:
+	}
 }
 
 func (l *Logger) Close() {
@@ -40,8 +50,10 @@ func (l *Logger) Close() {
 		return
 	}
 	l.closed = true
-	close(l.events)
+	close(l.stop)
 	l.mu.Unlock()
+	l.pubs.Wait()
+	close(l.events)
 	<-l.done
 }
 
