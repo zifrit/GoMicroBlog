@@ -3,8 +3,10 @@ package service
 import (
 	"errors"
 	"strings"
+	"sync"
 
 	"MicroBlog/internal/models"
+	"MicroBlog/internal/syncutils"
 )
 
 var (
@@ -16,17 +18,27 @@ var (
 	ErrInvalidPost  = errors.New("post text is required")
 )
 
-// Service contains all application data in memory.
-type Service struct {
-	users      map[string]*models.User
-	posts      []*models.Post
-	nextPostID int
+type EventPublisher interface {
+	Publish(string)
 }
 
-func New() *Service {
+type Service struct {
+	mu         sync.RWMutex
+	users      map[string]*models.User
+	posts      []*models.Post
+	nextPostID syncutils.Counter
+	events     EventPublisher
+}
+
+func New(events ...EventPublisher) *Service {
+	var publisher EventPublisher
+	if len(events) > 0 {
+		publisher = events[0]
+	}
 	return &Service{
-		users: make(map[string]*models.User),
-		posts: make([]*models.Post, 0),
+		users:  make(map[string]*models.User),
+		posts:  make([]*models.Post, 0),
+		events: publisher,
 	}
 }
 
@@ -35,7 +47,9 @@ func (s *Service) Register(username string) (*models.User, error) {
 	if username == "" {
 		return nil, ErrInvalidUser
 	}
+	s.mu.Lock()
 	if _, exists := s.users[username]; exists {
+		s.mu.Unlock()
 		return nil, ErrUserExists
 	}
 
@@ -44,42 +58,55 @@ func (s *Service) Register(username string) (*models.User, error) {
 		Username: username,
 	}
 	s.users[username] = user
-	return cloneUser(user), nil
+	result := cloneUser(user)
+	event := "user registered: " + username
+	s.mu.Unlock()
+	s.publish(event)
+	return result, nil
 }
 
 func (s *Service) CreatePost(username string, text string) (*models.Post, error) {
 	username = strings.TrimSpace(username)
-	user, exists := s.users[username]
-	if !exists {
-		return nil, ErrUserNotFound
-	}
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return nil, ErrInvalidPost
 	}
+	s.mu.Lock()
+	user, exists := s.users[username]
+	if !exists {
+		s.mu.Unlock()
+		return nil, ErrUserNotFound
+	}
 
-	s.nextPostID++
 	post := &models.Post{
-		ID:     s.nextPostID,
+		ID:     int(s.nextPostID.Next()),
 		Author: user,
 		Text:   text,
 		Likes:  make([]string, 0),
 	}
 	s.posts = append(s.posts, post)
-	return clonePost(post), nil
+	result := clonePost(post)
+	event := "post created: " + post.Text
+	s.mu.Unlock()
+	s.publish(event)
+	return result, nil
 }
 
 func (s *Service) ListPosts() []*models.Post {
-	posts := make([]*models.Post, 0, len(s.posts))
-	for _, post := range s.posts {
-		posts = append(posts, clonePost(post))
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	posts := make([]*models.Post, len(s.posts))
+	for index, post := range s.posts {
+		posts[index] = clonePost(post)
 	}
 	return posts
 }
 
 func (s *Service) LikePost(postID int, username string) (*models.Post, error) {
 	username = strings.TrimSpace(username)
+	s.mu.Lock()
 	if _, exists := s.users[username]; !exists {
+		s.mu.Unlock()
 		return nil, ErrUserNotFound
 	}
 
@@ -89,14 +116,41 @@ func (s *Service) LikePost(postID int, username string) (*models.Post, error) {
 		}
 		for _, likedBy := range post.Likes {
 			if likedBy == username {
+				s.mu.Unlock()
 				return nil, ErrAlreadyLiked
 			}
 		}
 		post.Likes = append(post.Likes, username)
-		return clonePost(post), nil
+		result := clonePost(post)
+		event := "post liked: " + username
+		s.mu.Unlock()
+		s.publish(event)
+		return result, nil
 	}
 
+	s.mu.Unlock()
 	return nil, ErrPostNotFound
+}
+
+func (s *Service) ValidateLike(postID int, username string) error {
+	username = strings.TrimSpace(username)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, exists := s.users[username]; !exists {
+		return ErrUserNotFound
+	}
+	for _, post := range s.posts {
+		if post.ID == postID {
+			return nil
+		}
+	}
+	return ErrPostNotFound
+}
+
+func (s *Service) publish(event string) {
+	if s.events != nil {
+		s.events.Publish(event)
+	}
 }
 
 func cloneUser(user *models.User) *models.User {
@@ -108,11 +162,9 @@ func cloneUser(user *models.User) *models.User {
 }
 
 func clonePost(post *models.Post) *models.Post {
-	if post == nil {
-		return nil
-	}
 	clonePost := *post
 	clonePost.Author = cloneUser(post.Author)
-	clonePost.Likes = append([]string(nil), post.Likes...)
+	clonePost.Likes = make([]string, len(post.Likes))
+	copy(clonePost.Likes, post.Likes)
 	return &clonePost
 }

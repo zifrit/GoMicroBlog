@@ -5,12 +5,20 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"MicroBlog/internal/queue"
 	"MicroBlog/internal/service"
 )
 
 func TestPostsFlow(t *testing.T) {
-	handler := New(service.New())
+	appService := service.New()
+	likes := queue.NewLikeQueue(1, func(job queue.LikeJob) error {
+		_, err := appService.LikePost(job.PostID, job.Username)
+		return err
+	}, nil)
+	t.Cleanup(likes.Close)
+	handler := New(appService, likes)
 
 	register := request(handler, http.MethodPost, "/register", `{"username":"alice"}`)
 	if register.Code != http.StatusCreated {
@@ -23,8 +31,21 @@ func TestPostsFlow(t *testing.T) {
 	}
 
 	like := request(handler, http.MethodPost, "/posts/1/like", `{"username":"alice"}`)
-	if like.Code != http.StatusOK {
+	if like.Code != http.StatusAccepted {
 		t.Fatalf("like status: got %d", like.Code)
+	}
+
+	deadline := time.After(time.Second)
+	for {
+		feed := request(handler, http.MethodGet, "/posts", "")
+		if strings.Contains(feed.Body.String(), `"likes":["alice"]`) {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("like was not processed: %s", feed.Body.String())
+		case <-time.After(time.Millisecond):
+		}
 	}
 
 	feed := request(handler, http.MethodGet, "/posts", "")
