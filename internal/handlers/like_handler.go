@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -44,12 +45,20 @@ func (h *Handler) postAction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	username := strings.TrimSpace(request.Username)
-	if err := h.service.ValidateLike(postID, username); err != nil {
+	if err := h.service.ValidateLike(r.Context(), postID, username); err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	if err := h.likes.Submit(queue.LikeJob{PostID: postID, Username: username}); err != nil {
-		if errors.Is(err, queue.ErrClosed) {
+	job := queue.LikeJob{
+		PostID:   postID,
+		Username: username,
+	}
+	err = h.likes.SubmitContext(r.Context(), job)
+	if err != nil {
+		queueClosed := errors.Is(err, queue.ErrClosed)
+		requestCanceled := errors.Is(err, context.Canceled)
+		requestTimedOut := errors.Is(err, context.DeadlineExceeded)
+		if queueClosed || requestCanceled || requestTimedOut {
 			writeError(w, http.StatusServiceUnavailable, "like queue is unavailable")
 			return
 		}

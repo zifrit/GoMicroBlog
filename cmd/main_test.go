@@ -5,10 +5,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"MicroBlog/internal/testutil"
 )
 
 func TestApplicationExposesPprofEndpoint(t *testing.T) {
-	app := newApplication(&bytes.Buffer{})
+	app := newApplication(&bytes.Buffer{}, testutil.NewDB())
 	t.Cleanup(app.Close)
 
 	request := httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil)
