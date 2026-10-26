@@ -24,14 +24,19 @@ func (request *createPostRequest) validate() error {
 func (h *Handler) posts(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, h.service.ListPosts())
+		posts, err := h.service.ListPosts(r.Context())
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, posts)
 	case http.MethodPost:
 		var request createPostRequest
 		if !decodeJSON(w, r, &request) {
 			return
 		}
 
-		post, err := h.service.CreatePost(request.Username, request.Text)
+		post, err := h.service.CreatePost(r.Context(), request.Username, request.Text)
 		if err != nil {
 			writeServiceError(w, err)
 			return
