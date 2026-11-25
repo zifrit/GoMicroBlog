@@ -1,19 +1,19 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"strings"
-	"sync"
 
 	"MicroBlog/internal/models"
-	"MicroBlog/internal/syncutils"
+	"MicroBlog/internal/repository"
 )
 
 var (
-	ErrUserExists   = errors.New("user already exists")
-	ErrUserNotFound = errors.New("user not found")
-	ErrPostNotFound = errors.New("post not found")
-	ErrAlreadyLiked = errors.New("post already liked by this user")
+	ErrUserExists   = repository.ErrUserExists
+	ErrUserNotFound = repository.ErrUserNotFound
+	ErrPostNotFound = repository.ErrPostNotFound
+	ErrAlreadyLiked = repository.ErrAlreadyLiked
 	ErrInvalidUser  = errors.New("username is required")
 	ErrInvalidPost  = errors.New("post text is required")
 )
@@ -23,148 +23,65 @@ type EventPublisher interface {
 }
 
 type Service struct {
-	mu         sync.RWMutex
-	users      map[string]*models.User
-	posts      []*models.Post
-	nextPostID syncutils.Counter
-	events     EventPublisher
+	db     repository.DB
+	events EventPublisher
 }
 
-func New(events ...EventPublisher) *Service {
-	var publisher EventPublisher
-	if len(events) > 0 {
-		publisher = events[0]
-	}
+// New получает БД и логгер. В тестах без событий вместо логгера передаётся nil.
+func New(db repository.DB, events EventPublisher) *Service {
 	return &Service{
-		users:  make(map[string]*models.User),
-		posts:  make([]*models.Post, 0),
-		events: publisher,
+		db:     db,
+		events: events,
 	}
 }
 
-func (s *Service) Register(username string) (*models.User, error) {
+func (s *Service) Register(ctx context.Context, username string) (*models.User, error) {
 	username = strings.TrimSpace(username)
 	if username == "" {
 		return nil, ErrInvalidUser
 	}
-	s.mu.Lock()
-	if _, exists := s.users[username]; exists {
-		s.mu.Unlock()
-		return nil, ErrUserExists
+	user, err := s.db.Register(ctx, username)
+	if err != nil {
+		return nil, err
 	}
-
-	user := &models.User{
-		ID:       username,
-		Username: username,
-	}
-	s.users[username] = user
-	result := cloneUser(user)
-	event := "user registered: " + username
-	s.mu.Unlock()
-	s.publish(event)
-	return result, nil
+	s.publish("user registered: " + username)
+	return user, nil
 }
 
-func (s *Service) CreatePost(username string, text string) (*models.Post, error) {
+func (s *Service) CreatePost(ctx context.Context, username, text string) (*models.Post, error) {
 	username = strings.TrimSpace(username)
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return nil, ErrInvalidPost
 	}
-	s.mu.Lock()
-	user, exists := s.users[username]
-	if !exists {
-		s.mu.Unlock()
-		return nil, ErrUserNotFound
+	post, err := s.db.CreatePost(ctx, username, text)
+	if err != nil {
+		return nil, err
 	}
-
-	post := &models.Post{
-		ID:     int(s.nextPostID.Next()),
-		Author: user,
-		Text:   text,
-		Likes:  make([]string, 0),
-	}
-	s.posts = append(s.posts, post)
-	result := clonePost(post)
-	event := "post created: " + post.Text
-	s.mu.Unlock()
-	s.publish(event)
-	return result, nil
+	s.publish("post created: " + post.Text)
+	return post, nil
 }
 
-func (s *Service) ListPosts() []*models.Post {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	posts := make([]*models.Post, len(s.posts))
-	for index, post := range s.posts {
-		posts[index] = clonePost(post)
-	}
-	return posts
+func (s *Service) ListPosts(ctx context.Context) ([]*models.Post, error) {
+	return s.db.ListPosts(ctx)
 }
 
-func (s *Service) LikePost(postID int, username string) (*models.Post, error) {
+func (s *Service) LikePost(ctx context.Context, postID int, username string) (*models.Post, error) {
 	username = strings.TrimSpace(username)
-	s.mu.Lock()
-	if _, exists := s.users[username]; !exists {
-		s.mu.Unlock()
-		return nil, ErrUserNotFound
+	post, err := s.db.LikePost(ctx, postID, username)
+	if err != nil {
+		return nil, err
 	}
-
-	for _, post := range s.posts {
-		if post.ID != postID {
-			continue
-		}
-		for _, likedBy := range post.Likes {
-			if likedBy == username {
-				s.mu.Unlock()
-				return nil, ErrAlreadyLiked
-			}
-		}
-		post.Likes = append(post.Likes, username)
-		result := clonePost(post)
-		event := "post liked: " + username
-		s.mu.Unlock()
-		s.publish(event)
-		return result, nil
-	}
-
-	s.mu.Unlock()
-	return nil, ErrPostNotFound
+	s.publish("post liked: " + username)
+	return post, nil
 }
 
-func (s *Service) ValidateLike(postID int, username string) error {
-	username = strings.TrimSpace(username)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if _, exists := s.users[username]; !exists {
-		return ErrUserNotFound
-	}
-	for _, post := range s.posts {
-		if post.ID == postID {
-			return nil
-		}
-	}
-	return ErrPostNotFound
+func (s *Service) ValidateLike(ctx context.Context, postID int, username string) error {
+	return s.db.ValidateLike(ctx, postID, strings.TrimSpace(username))
 }
 
 func (s *Service) publish(event string) {
 	if s.events != nil {
 		s.events.Publish(event)
 	}
-}
-
-func cloneUser(user *models.User) *models.User {
-	if user == nil {
-		return nil
-	}
-	cloneUser := *user
-	return &cloneUser
-}
-
-func clonePost(post *models.Post) *models.Post {
-	clonePost := *post
-	clonePost.Author = cloneUser(post.Author)
-	clonePost.Likes = make([]string, len(post.Likes))
-	copy(clonePost.Likes, post.Likes)
-	return &clonePost
 }

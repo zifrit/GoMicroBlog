@@ -1,12 +1,12 @@
 package models
 
-// User is a registered microblog user.
+// User описывает зарегистрированного пользователя MicroBlog.
 type User struct {
 	ID       string `json:"id"`
 	Username string `json:"username"`
 }
 
-// Post is a message published by a user.
+// Post описывает сообщение, опубликованное пользователем.
 type Post struct {
 	ID     int      `json:"id"`
 	Author *User    `json:"author"`

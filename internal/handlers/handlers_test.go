@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,12 +10,13 @@ import (
 
 	"MicroBlog/internal/queue"
 	"MicroBlog/internal/service"
+	"MicroBlog/internal/testutil"
 )
 
 func TestPostsFlow(t *testing.T) {
-	appService := service.New()
+	appService := service.New(testutil.NewDB(), nil)
 	likes := queue.NewLikeQueue(1, func(job queue.LikeJob) error {
-		_, err := appService.LikePost(job.PostID, job.Username)
+		_, err := appService.LikePost(context.Background(), job.PostID, job.Username)
 		return err
 	}, nil)
 	t.Cleanup(likes.Close)

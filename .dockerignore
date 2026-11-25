@@ -1,0 +1,10 @@
+.git
+.idea
+.vscode
+.env
+.superpowers
+graphify-out
+docs
+*.out
+*.test
+coverage.*

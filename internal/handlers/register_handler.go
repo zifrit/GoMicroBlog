@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -12,14 +13,14 @@ import (
 )
 
 type Application interface {
-	Register(string) (*models.User, error)
-	CreatePost(string, string) (*models.Post, error)
-	ListPosts() []*models.Post
-	ValidateLike(int, string) error
+	Register(context.Context, string) (*models.User, error)
+	CreatePost(context.Context, string, string) (*models.Post, error)
+	ListPosts(context.Context) ([]*models.Post, error)
+	ValidateLike(context.Context, int, string) error
 }
 
 type LikeSubmitter interface {
-	Submit(queue.LikeJob) error
+	SubmitContext(context.Context, queue.LikeJob) error
 }
 
 type Handler struct {
@@ -39,8 +40,8 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
-func New(s Application, likes LikeSubmitter) http.Handler {
-	h := &Handler{service: s, likes: likes}
+func New(appService Application, likes LikeSubmitter) http.Handler {
+	h := &Handler{service: appService, likes: likes}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/register", h.register)
 	mux.HandleFunc("/posts", h.posts)
@@ -66,7 +67,7 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := h.service.Register(request.Username)
+	user, err := h.service.Register(r.Context(), request.Username)
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -88,11 +89,15 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, value requestPayload) bo
 }
 
 func writeServiceError(w http.ResponseWriter, err error) {
-	status := http.StatusBadRequest
-	if errors.Is(err, service.ErrUserNotFound) || errors.Is(err, service.ErrPostNotFound) {
-		status = http.StatusNotFound
+	switch {
+	case errors.Is(err, service.ErrUserNotFound), errors.Is(err, service.ErrPostNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, service.ErrUserExists), errors.Is(err, service.ErrAlreadyLiked),
+		errors.Is(err, service.ErrInvalidUser), errors.Is(err, service.ErrInvalidPost):
+		writeError(w, http.StatusBadRequest, err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, "internal server error")
 	}
-	writeError(w, status, err.Error())
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

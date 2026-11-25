@@ -7,13 +7,13 @@ import (
 )
 
 type Logger struct {
-	events chan string
-	writer *log.Logger
-	mu     sync.Mutex
-	closed bool
-	stop   chan struct{}
-	pubs   sync.WaitGroup
-	done   chan struct{}
+	events     chan string
+	writer     *log.Logger
+	mu         sync.Mutex
+	closed     bool
+	stop       chan struct{}
+	publishers sync.WaitGroup
+	done       chan struct{}
 }
 
 func New(output io.Writer, bufferSize int) *Logger {
@@ -33,10 +33,12 @@ func (l *Logger) Publish(event string) {
 		l.mu.Unlock()
 		return
 	}
-	l.pubs.Add(1)
+	// Close должен дождаться каждого отправителя перед закрытием канала.
+	l.publishers.Add(1)
 	l.mu.Unlock()
-	defer l.pubs.Done()
+	defer l.publishers.Done()
 
+	// Отправляем без блокировки mu, иначе Close не сможет остановить ожидание.
 	select {
 	case l.events <- event:
 	case <-l.stop:
@@ -49,11 +51,13 @@ func (l *Logger) Close() {
 		l.mu.Unlock()
 		return
 	}
+	// Новые события больше не принимаются; заблокированные отправители просыпаются.
 	l.closed = true
 	close(l.stop)
 	l.mu.Unlock()
-	l.pubs.Wait()
+	l.publishers.Wait()
 	close(l.events)
+	// Ждём записи всех уже принятых событий.
 	<-l.done
 }
 
