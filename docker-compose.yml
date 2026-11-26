@@ -1,46 +1,117 @@
 services:
-  app:
-    build: .
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
     environment:
-      DATABASE_URL: postgres://microblog:microblog@db:5432/microblog?sslmode=disable
-      HTTP_ADDR: :8080
+      DATABASE_URL: ${DATABASE_URL:-postgres://microblog:microblog@db:5432/microblog?sslmode=disable}
+      HTTP_ADDR: ${HTTP_ADDR:-:8080}
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-microblog.events}
+      KAFKA_RETRY_INITIAL: ${KAFKA_RETRY_INITIAL:-1s}
+      KAFKA_RETRY_MAX: ${KAFKA_RETRY_MAX:-30s}
+      OUTBOX_POLL_INTERVAL: ${OUTBOX_POLL_INTERVAL:-250ms}
+      OUTBOX_BACKLOG_LOG_INTERVAL: ${OUTBOX_BACKLOG_LOG_INTERVAL:-30s}
     ports:
-      - "${APP_PORT:-8080}:8080"
+      - "127.0.0.1:${API_PORT:-8080}:8080"
     depends_on:
       db:
         condition: service_healthy
-    # The queue drains accepted likes before the pool closes (5s per job).
-    stop_grace_period: 12m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  engagement:
+    build:
+      context: .
+      dockerfile: Dockerfile.engagement
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://microblog:microblog@db:5432/microblog?sslmode=disable}
+      HTTP_ADDR: ${ENGAGEMENT_HTTP_ADDR:-:8081}
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-microblog.events}
+      KAFKA_GROUP_ID: ${KAFKA_GROUP_ID:-engagement-stats-v1}
+      KAFKA_RETRY_INITIAL: ${KAFKA_RETRY_INITIAL:-1s}
+      KAFKA_RETRY_MAX: ${KAFKA_RETRY_MAX:-30s}
+    ports:
+      - "127.0.0.1:${ENGAGEMENT_PORT:-8081}:8081"
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8081/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
 
   db:
     image: postgres:17.9-alpine
     environment:
-      POSTGRES_DB: microblog
-      POSTGRES_USER: microblog
-      POSTGRES_PASSWORD: microblog
+      POSTGRES_DB: ${POSTGRES_DB:-microblog}
+      POSTGRES_USER: ${POSTGRES_USER:-microblog}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-microblog}
     ports:
       - "127.0.0.1:${DB_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U microblog -d microblog"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 2s
       timeout: 3s
       retries: 30
     restart: unless-stopped
 
+  kafka:
+    image: apache/kafka:4.4.0
+    environment:
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: CONTROLLER://:29093,INTERNAL://:9092,HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,HOST://localhost:${KAFKA_PORT:-9092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_MS: "-1"
+    ports:
+      - "127.0.0.1:${KAFKA_PORT:-9092}:29092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
+    restart: unless-stopped
+
   pgadmin:
     image: dpage/pgadmin4:9.9
+    profiles: [tools]
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@example.com
-      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-change-me-local}
       PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
     ports:
       - "127.0.0.1:${PGADMIN_PORT:-5050}:80"
     volumes:
       - pgadmin_data:/var/lib/pgadmin
-      - ./deployments/pgadmin-servers.json:/pgadmin4/servers.json:ro
     depends_on:
       db:
         condition: service_healthy
@@ -48,4 +119,5 @@ services:
 
 volumes:
   postgres_data:
+  kafka_data:
   pgadmin_data:

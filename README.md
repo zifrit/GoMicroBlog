@@ -1,203 +1,140 @@
 # MicroBlog
 
-Небольшой REST-сервис на Go для публикации постов и лайков. Пользователи,
-посты и лайки хранятся в PostgreSQL 17.9 и сохраняются после перезапуска.
-Приложение использует pgxpool, SQL-билдер Squirrel и миграции Goose.
+Небольшой REST-сервис на Go для публикации постов и лайков. В Sprint 4 приложение разделено на два HTTP-сервиса: `api` принимает пользовательские запросы, а `engagement` строит проекцию счётчиков лайков из событий Kafka.
 
-## Возможности
+Стек: Go 1.26, PostgreSQL 17.9, Apache Kafka 4.4.0 в KRaft-режиме, Goose, pgx и franz-go.
 
-- регистрация пользователей;
-- создание и просмотр постов;
-- асинхронная постановка лайка в очередь;
-- транзакционная обработка лайков и ограничения PK/FK/CHECK в БД;
-- годовое range-партиционирование постов и индексы BTREE;
-- событийное логирование в stdout;
-- профилирование через `net/http/pprof`.
+## Архитектура
+
+- `api` обслуживает регистрацию, посты и лайки. Он записывает изменение данных и событие в `api.outbox_events` одной транзакцией PostgreSQL.
+- Фоновый outbox relay публикует события в Kafka после COMMIT. Он повторяет отправку с exponential backoff и не удаляет событие после ошибки.
+- `engagement` читает Kafka и в одной транзакции записывает ID обработанного события и обновляет `engagement.post_like_counters`. Повторная доставка не увеличивает счётчик повторно.
+- Одна база данных содержит схемы `api` и `engagement`. Kafka topic по умолчанию — `microblog.events`, с тремя partitions и replication factor 1.
+- Для `microblog.events` задан `retention.ms=-1`: Kafka не удаляет события по возрасту, пока сохраняется её volume. Это исключает потерю ещё не обработанных событий из-за срока хранения, но журнал растёт без ограничения; следите за свободным местом.
+- Публикация и потребление работают с гарантией at-least-once. Сбой после Kafka ACK, но до отметки outbox может дать повторную доставку; `engagement.processed_events` устраняет повторный эффект.
+
+```text
+REST client → api → PostgreSQL api schema → outbox relay → Kafka
+                                                        ↓
+REST client ← engagement REST ← PostgreSQL projection ← consumer
+```
 
 ## Структура
 
 ```text
 MicroBlog/
-├── cmd/
-│   ├── main.go                 # HTTP-сервер, pool, миграции, shutdown
-│   └── migrate/                # CLI для Goose up/down
-├── db/
-│   ├── migrations/             # встроенные SQL-миграции Goose
-│   └── explain.sql             # планы запросов и partition pruning
-├── deployments/                # настройка подключения pgAdmin
-├── internal/
-│   ├── handlers/               # HTTP, JSON, передача контекста запроса
-│   ├── logger/                 # логгер событий на канале
-│   ├── models/                 # User и Post; прежний JSON-контракт
-│   ├── queue/                  # очередь и worker для лайков
-│   ├── repository/             # pgxpool + Squirrel, транзакции
-│   ├── service/                # нормализация и бизнес-логика
-│   ├── syncutils/              # атомарный счётчик из предыдущего спринта
-│   └── testutil/               # тестовая БД
+├── cmd/migrate/                  # CLI для Goose up/down
+├── db/migrations/                # миграции PostgreSQL
+├── internal/database/            # общий конструктор пула PostgreSQL
+├── internal/events/              # общий контракт событий
+├── services/api/                 # REST API, repository, outbox relay, Kafka producer
+├── services/engagement/          # REST статистика, Kafka consumer, проекция
+├── Dockerfile.api
+├── Dockerfile.engagement
 ├── docker-compose.yml
-├── Dockerfile
 └── Makefile
 ```
 
 ## Запуск через Docker Compose
 
-Требуется Docker с Compose v2:
+Требуется Docker с Compose v2. Для локальной разработки можно скопировать шаблон окружения:
 
 ```bash
-docker compose up --build -d
+cp .env.example .env
+docker compose up --build -d --remove-orphans
 # либо make up
 ```
 
-После готовности PostgreSQL приложение автоматически применяет миграции.
-Сервисы:
+Стандартный Compose запускает четыре сервиса: `api`, `engagement`, `db` и один Kafka broker/controller в KRaft-режиме. PostgreSQL и Kafka сохраняют состояние в Docker volumes. При старте `api` применяет миграции Goose. Его health check проверяет PostgreSQL; доступность Kafka не блокирует HTTP API. Сервис `engagement` начинает запуск после готовности `api` и PostgreSQL, но REST статистики работает независимо от Kafka.
+
+Адреса по умолчанию:
 
 - API: http://localhost:8080;
-- PostgreSQL: localhost:5432, база/пользователь/пароль `microblog`;
-- pgAdmin: http://localhost:5050, логин `admin@example.com`, пароль `admin`.
+- статистика: http://localhost:8081;
+- PostgreSQL: `localhost:5432`;
+- Kafka для локальных Go-процессов: `localhost:9092`.
 
-Это локальные настройки для разработки. В pgAdmin сервер `MicroBlog` уже
-добавлен: адрес `db:5432`, пользователь `microblog`, пароль `microblog`.
-Тома `postgres_data` и `pgadmin_data` сохраняют данные при остановке контейнеров.
-
-```bash
-docker compose logs -f app
-docker compose restart app       # данные остаются в БД
-docker compose down              # тома сохраняются
-```
-
-`docker compose down -v` удаляет тома вместе с данными.
-Порты можно переопределить, например:
+pgAdmin не запускается в стандартной конфигурации. Запустить его можно отдельно:
 
 ```bash
-APP_PORT=18080 DB_PORT=15432 PGADMIN_PORT=15050 docker compose up --build -d
+docker compose --profile tools up --build -d
 ```
+
+pgAdmin будет доступен по адресу http://localhost:5050. Учётные данные берутся из `PGADMIN_DEFAULT_EMAIL` и `PGADMIN_DEFAULT_PASSWORD` в `.env`. Добавьте сервер `MicroBlog` вручную: host `db`, port `5432`, а имя базы, пользователь и пароль — значения `POSTGRES_DB`, `POSTGRES_USER` и `POSTGRES_PASSWORD`.
+
+### Обновление с Sprint 3
+
+Сначала остановите старый API из Sprint 3 checkout, пока там ещё доступна старая Compose-конфигурация. Команда ждёт завершения принятой очереди лайков. Затем остановите остальные контейнеры без удаления named volumes:
+
+```bash
+docker compose stop --timeout 720 app
+docker compose down
+```
+
+После обновления файлов Sprint 4 скопируйте `.env.example` в `.env` и выполните `docker compose up --build -d --remove-orphans`. Сервис `db` подключится к существующему `postgres_data`; миграция перенесёт таблицы в схему `api`. Шаблон сохраняет прежние локальные реквизиты PostgreSQL (`microblog`), потому что изменение `POSTGRES_PASSWORD` в окружении не меняет пароль роли в уже созданном volume. Для другого существующего пароля задайте его и в `POSTGRES_PASSWORD`, и в `DATABASE_URL`.
+
+```bash
+docker compose ps
+docker compose logs -f api engagement kafka
+docker compose down       # named volumes сохраняются
+docker compose down -v    # удаляет БД и Kafka вместе с volumes
+```
+
+Порты можно изменить в `.env`: `API_PORT`, `ENGAGEMENT_PORT`, `DB_PORT`, `KAFKA_PORT` и `PGADMIN_PORT`. При смене `KAFKA_PORT` локальные Go-процессы подключаются через `KAFKA_BROKERS=localhost:<новый порт>`. При смене пароля PostgreSQL синхронно обновите `POSTGRES_PASSWORD` и пароль в `DATABASE_URL`. Значения `.env.example` предназначены только для локальной разработки.
 
 ## Локальный запуск Go
 
-Требуется Go 1.26 и работающий PostgreSQL:
+Требуются Go 1.26 и Docker с Compose. Поднимите PostgreSQL и Kafka:
 
 ```bash
-docker compose up -d db
-export DATABASE_URL='postgres://microblog:microblog@localhost:5432/microblog?sslmode=disable'
-go run ./cmd
-# либо make run (с локальным DATABASE_URL по умолчанию)
+docker compose up -d db kafka
+make run-api
 ```
 
-`DATABASE_URL` обязателен для запуска без Make. `HTTP_ADDR` по умолчанию
-равен `:8080`. При `Ctrl+C` сервер завершает HTTP-запросы, затем обрабатывает
-принятые задачи очереди, закрывает логгер и пул БД. Одна задача лайка имеет
-таймаут 5 секунд. При заполненной очереди ожидание постановки прекращается
-при отмене HTTP-запроса или его таймауте (10 секунд). Очередь остаётся в памяти: `202 Accepted` подтверждает приём
-задачи, а сохранение лайка выполняется после COMMIT. При принудительном
-завершении процесса ещё не обработанные задачи теряются.
-
-## Миграции
+В другом терминале запустите consumer и REST-сервис статистики:
 
 ```bash
-make migrate-up
-make migrate-down  # откатывает последнюю миграцию; 001 удаляет все три таблицы
-# Для другой БД:
-make migrate-up DATABASE_URL='postgres://user:password@localhost:5432/db?sslmode=disable'
+make run-engagement
 ```
 
-CLI находится в `cmd/migrate`, миграции встроены в оба бинарника. Отдельная
-установка Goose не нужна. Файл `001_init.sql` содержит секции `-- +goose Up`
-и `-- +goose Down`: это формат Goose вместо пары файлов `.up.sql/.down.sql`.
-В контейнере команды доступны как `docker compose exec app /app/migrate up`
-и `docker compose exec app /app/migrate down`. Перед откатом остановите запросы
-к приложению: после удаления таблиц API будет возвращать 500.
-
-## Схема и партиции
-
-`users.id` остаётся строковым именем пользователя, публичный `posts.id`
-выдаётся общей identity-последовательностью PostgreSQL. Во всех таблицах есть
-`created_at TIMESTAMPTZ NOT NULL DEFAULT now()`.
-
-Посты разделены по `created_at` на UTC-годы `posts_2024`–`posts_2027`.
-`posts_default` принимает даты вне этих диапазонов, поэтому после 2027 года
-запись продолжит работать. Новые годовые партиции добавляются отдельной
-миграцией; если в default уже есть строки за нужный год, перед созданием
-партиции их нужно перенести.
-
-PK постов — `(id, created_at)`: PostgreSQL требует включать ключ
-партиционирования в уникальное ограничение родительской таблицы.
-`likes` ссылается на пост составным FK `(post_id, post_created_at)`, а PK
-`(post_id, post_created_at, user_id)` запрещает повторный лайк. Индекс этого
-PK покрывает поиск по `post_id`; отдельные BTREE-индексы созданы для
-`posts.user_id` и `likes.user_id`. Пользователь и текст не могут быть пустыми.
-
-Worker выполняет проверку пользователя и поста, вставку лайка и чтение
-результата в одной транзакции. Событие публикуется после успешного COMMIT.
-При ошибке транзакция откатывается, worker пишет причину в лог.
+Makefile по умолчанию подключается к `localhost:5432` и Kafka `localhost:9092`. Для других адресов передайте переменные при запуске:
 
 ```bash
-make explain
+make run-api DATABASE_URL='postgres://user:password@localhost:5432/microblog?sslmode=disable' KAFKA_BROKERS=localhost:9092
+make run-engagement DATABASE_URL='postgres://user:password@localhost:5432/microblog?sslmode=disable' KAFKA_BROKERS=localhost:9092
 ```
 
-Команда выполняет `db/explain.sql`: `EXPLAIN (ANALYZE, BUFFERS)` для поиска
-постов автора за год и поиска лайков по посту/пользователю. На маленькой
-таблице PostgreSQL может предпочесть последовательное сканирование.
-Условие по `created_at` позволяет исключить ненужные партиции; запрос
-только по `id` проверяет индексы всех партиций.
+Основные настройки: `DATABASE_URL`, `HTTP_ADDR`, `KAFKA_BROKERS`, `KAFKA_TOPIC`, `KAFKA_GROUP_ID`, `OUTBOX_POLL_INTERVAL`, `KAFKA_RETRY_INITIAL`, `KAFKA_RETRY_MAX` и `OUTBOX_BACKLOG_LOG_INTERVAL`. Длительности задаются в формате Go, например `250ms`, `1s` или `30s`. Backlog outbox доступен в структурированных логах relay как `pending_count` и `oldest_pending_age_seconds`; REST endpoint для него не добавлен.
 
-## API
-
-| Метод | Путь | Успешный ответ | Назначение |
-| --- | --- | --- | --- |
-| `POST` | `/register` | `201 Created` | Регистрирует пользователя |
-| `POST` | `/posts` | `201 Created` | Создаёт пост от зарегистрированного пользователя |
-| `GET` | `/posts` | `200 OK` | Возвращает ленту постов |
-| `POST` | `/posts/{id}/like` | `202 Accepted` | Ставит задачу лайка в фоновую очередь |
+## REST API
 
 Все тела запросов и ответов используют JSON.
 
-### Регистрация
+| Метод | Путь | Успешный ответ | Назначение |
+| --- | --- | --- | --- |
+| `POST` | `http://localhost:8080/register` | `201 Created` | Регистрирует пользователя |
+| `POST` | `http://localhost:8080/posts` | `201 Created` | Создаёт пост |
+| `GET` | `http://localhost:8080/posts` | `200 OK` | Возвращает ленту |
+| `POST` | `http://localhost:8080/posts/{id}/like` | `202 Accepted` | Фиксирует лайк и событие в outbox |
+| `GET` | `http://localhost:8080/healthz` | `200 OK` / `503` | Проверяет PostgreSQL для API |
+| `GET` | `http://localhost:8081/stats/posts/{id}` | `200 OK` / `404` | Возвращает проекцию счётчика лайков |
+| `GET` | `http://localhost:8081/healthz` | `200 OK` / `503` | Проверяет PostgreSQL для `engagement` |
+
+### Регистрация и пост
 
 ```bash
 curl -i -X POST http://localhost:8080/register \
   -H 'Content-Type: application/json' \
   -d '{"username":"alice"}'
-```
 
-Ответ `201 Created`:
-
-```json
-{"id":"alice","username":"alice"}
-```
-
-Пустое или уже занятое имя возвращает `400 Bad Request`.
-
-### Создание поста
-
-```bash
 curl -i -X POST http://localhost:8080/posts \
   -H 'Content-Type: application/json' \
   -d '{"username":"alice","text":"Привет, мир!"}'
 ```
 
-Ответ `201 Created`:
+Регистрация отвечает `201 Created`, например `{"id":"alice","username":"alice"}`. Создание поста также отвечает `201 Created`. Неизвестный пользователь при создании поста даёт `404 Not Found`.
 
-```json
-{
-  "id": 1,
-  "author": {"id": "alice", "username": "alice"},
-  "text": "Привет, мир!",
-  "likes": []
-}
-```
-
-Если пользователь не зарегистрирован, сервер вернёт `404 Not Found`.
-
-### Лента
-
-```bash
-curl -i http://localhost:8080/posts
-```
-
-Ответ `200 OK` содержит массив постов. Для нового поста поле `likes` всегда
-имеет вид пустого массива `[]`, а не `null`.
-
-### Асинхронный лайк
+### Лайк и ответ `202 Accepted`
 
 ```bash
 curl -i -X POST http://localhost:8080/posts/1/like \
@@ -205,78 +142,59 @@ curl -i -X POST http://localhost:8080/posts/1/like \
   -d '{"username":"alice"}'
 ```
 
-Ответ `202 Accepted` означает, что задача принята очередью:
+`202 Accepted` возвращается после COMMIT лайка и события `PostLiked` в одной транзакции PostgreSQL. С этого момента запрос надёжно принят, даже если Kafka временно недоступна. Relay повторяет публикацию после восстановления брокера. Статистика обновляется позже, после обработки события сервисом `engagement`.
 
-```json
-{"status":"like accepted"}
-```
-
-Лайк применяется worker-горутиной, поэтому затем повторно запросите ленту:
+Повторный лайк того же пользователя возвращает такой же `202 Accepted`, но не меняет лайки и не создаёт новое событие. Лента содержит не более одного лайка пользователя на пост. Несуществующий пост или пользователь возвращает `404 Not Found`.
 
 ```bash
-curl http://localhost:8080/posts
+curl -i http://localhost:8080/posts
+curl -i http://localhost:8081/stats/posts/1
 ```
 
-```json
-[
-  {
-    "id": 1,
-    "author": {"id": "alice", "username": "alice"},
-    "text": "Привет, мир!",
-    "likes": ["alice"]
-  }
-]
+Ответ статистики имеет форму `{"post_id":1,"like_count":1}`. После `PostCreated` счётчик равен нулю и endpoint отвечает `200`. Если проекции ещё нет, endpoint отвечает `404`.
+
+### Посты и лайки, существовавшие до Sprint 4
+
+Миграция переносит текущие `users`, `posts` и `likes` из `public` в схему `api`, сохраняя строки. Проекция `engagement` начинается пустой и не делает backfill старых лайков. Поэтому для старого поста `/stats/posts/{id}` отвечает `404`, пока после миграции не появится событие для него. Первый новый лайк старого поста создаёт счётчик со значением `1`; прежние лайки в него не входят. Новые посты получают нулевую строку проекции через `PostCreated`.
+
+## Миграции и схема БД
+
+```bash
+make migrate-up
+make migrate-down
 ```
 
-Один пользователь может поставить одному посту только один лайк. Запрос на
-несуществующий пост или от незарегистрированного пользователя вернёт
-`404 Not Found`.
+`api` применяет миграции при запуске. Команды Makefile позволяют управлять миграциями отдельно. Sprint 4 migration переносит таблицы и существующие данные в `api`, а также создаёт outbox и таблицы проекции в `engagement`. Down-миграция отказывается выполняться, если в outbox остались неопубликованные события. Перед откатом остановите новые записи и дождитесь пустого outbox. Откат `001_init.sql` удаляет исходные таблицы и их данные.
 
-## Логирование и профилирование
+`posts` использует годовые range partitions `posts_2024`–`posts_2027` и `posts_default`. PK постов — `(id, created_at)`, а `likes` ссылается на составной ключ. PK лайка `(post_id, post_created_at, user_id)` запрещает повторный лайк. PostgreSQL требует включать ключ партиционирования в уникальный ключ родительской таблицы.
 
-В терминале сервера выводятся события регистрации, создания постов и успешно
-обработанных лайков. Например:
+Запросы для проверки планов выполняются в schema `api`:
 
-```text
-microblog: user registered: alice
-microblog: post created: Привет, мир!
-microblog: post liked: alice
-```
-
-Профили Go доступны по адресу:
-
-```text
-http://localhost:8080/debug/pprof/
+```bash
+make explain
 ```
 
 ## Проверки
 
-Unit-тесты не требуют Docker, используют тестовую БД из `internal/testutil`:
+Unit-тесты, race detector и `go vet`:
 
 ```bash
-go test ./...
-go test -race ./...
-go vet ./...
+make test
+make test-race
+make vet
 ```
 
-Интеграционные тесты через testcontainers-go поднимают временные контейнеры
-`postgres:17.9-alpine`; Docker должен быть запущен. База из Compose не меняется.
+Полный набор integration-тестов поднимает временные контейнеры PostgreSQL и Kafka через testcontainers-go. Требуется запущенный Docker:
 
 ```bash
 make test-integration
-# либо:
+# эквивалентно:
 go test -tags=integration -count=1 ./...
 ```
 
-Проверяются PK/FK/CHECK, конкурентная регистрация и повторные лайки, rollback
-при ошибке COMMIT, сохранение данных и ID после переподключения, годовые
-партиции и default, EXPLAIN, Goose down/up и отмена запросов. HTTP-тест
-проходит регистрацию → пост → асинхронный лайк → закрытие приложения → новое
-приложение с новым пулом → чтение сохранённого лайка. При отказе БД API
-возвращает 500 без внутренних SQL-ошибок в ответе.
-
-Бенчмарк слоя бизнес-логики на тестовой БД (не измеряет PostgreSQL):
+Конфигурация обоих Compose-профилей и Go-сборка:
 
 ```bash
-go test -bench=BenchmarkCreatePost -benchmem ./internal/service
+make config
+make build
 ```

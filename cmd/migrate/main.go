@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"MicroBlog/db/migrations"
-	"MicroBlog/internal/repository"
+	"MicroBlog/internal/database"
 )
 
 func main() {
@@ -32,7 +32,7 @@ func run() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	pool, err := repository.Open(ctx, dsn)
+	pool, err := database.OpenPool(ctx, dsn)
 	if err != nil {
 		return err
 	}
